@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Yamato Prompt-Installer (EFI + Btrfs + systemd-boot + First-Boot-Hook)
-# Getestet für Aufruf per: bash <(curl -fsSL https://b3luckyworks.github.io/install-yamato)
+# Yamato Prompt-Installer (EFI + Btrfs + Subvols + systemd-boot + First-Boot-Hook)
+# Nutzung im Arch-ISO empfohlen:
+#   bash <(curl -fsSL https://b3luckyworks.github.io/install-yamato)
 set -euo pipefail
 
-# ---- Helpers ---------------------------------------------------------------
+# ---------- Helper ----------
 need_root() { [[ $EUID -eq 0 ]] || { echo "Bitte als root ausführen."; exit 1; }; }
 is_archiso() { [[ -d /run/archiso ]] || grep -q '^VARIANT_ID=archiso' /etc/os-release 2>/dev/null; }
-have() { command -v "$1" >/dev/null 2>&1; }
 
-# Sicheres Lesen (auch wenn via Pipe gestartet): lese von /dev/tty
+# Sicheres Lesen (auch bei 'curl | bash'): immer von /dev/tty lesen
 read_tty() {
   local prompt="$1" default="${2-}" ans
   if [[ -r /dev/tty ]]; then
@@ -33,15 +33,13 @@ read_secret_tty() {
   echo "$pw"
 }
 
-abort() { echo "Abbruch."; exit 1; }
-
-# ---- Preconditions ---------------------------------------------------------
+# ---------- Preconditions ----------
 need_root
-# Stelle sicher, dass Prompts eine echte TTY bekommen
+# Stdin an TTY binden, falls via Pipe gestartet
 [[ ! -t 0 && -r /dev/tty ]] && exec </dev/tty
 
 if ! is_archiso; then
-  echo "[INFO] Kein Arch-Live-System → starte Yamato Konfiguration (Phase 2)…"
+  echo "[INFO] Kein Arch-Live-System → starte Yamato-Konfiguration (Phase 2)…"
   URL="https://raw.githubusercontent.com/b3luckyworks/yamato/HEAD/scripts/install.sh"
   TMP="/tmp/yamato-install.sh"
   curl -fsSL "$URL" -o "$TMP"
@@ -58,15 +56,15 @@ for p in curl git btrfs-progs dosfstools gptfdisk; do
 done
 ((${#need_pkgs[@]})) && pacman -Sy --noconfirm --needed "${need_pkgs[@]}"
 
-# ---- Prompts ---------------------------------------------------------------
+# ---------- Prompts ----------
 echo "=== Yamato Arch-Installer (prompt-basiert) ==="
 echo "Verfügbare Disks:"
-lsblk -dpno NAME,SIZE,MODEL | grep -E '/dev/(nvme|sd|vd|mmcblk)'
+lsblk -dpno NAME,SIZE,MODEL | grep -E '/dev/(nvme|sd|vd|mmcblk)' || true
 
 DISK="$(read_tty "Zieldisk eingeben (z.B. /dev/nvme0n1)")"
-[[ -b "$DISK" ]] || { echo "Ungültige Disk: $DISK"; abort; }
+[[ -b "$DISK" ]] || { echo "Ungültige Disk: $DISK"; exit 1; }
 echo "WARNUNG: $DISK wird KOMPLETT GELÖSCHT!"
-[[ "$(read_tty "Wirklich fortfahren? (YES/no)" "no")" == "YES" ]] || abort
+[[ "$(read_tty "Wirklich fortfahren? (YES/no)" "no")" == "YES" ]] || { echo "Abbruch."; exit 0; }
 
 HOSTNAME="$(read_tty "Hostname" "yamato")"
 USERNAME="$(read_tty "Neuer Benutzername" "bjorn")"
@@ -83,7 +81,7 @@ LOCALES="$(read_tty "Locales (Komma, in /etc/locale.gen aktivieren)" "de_DE.UTF-
 KEYMAP="$(read_tty "Konsole Keymap (vconsole.conf)" "de-latin1")"
 SWAPSIZE="$(read_tty "Swapfile-Größe (0G = kein Swap)" "2G")"
 
-# ---- Partitionierung (GPT: EFI + Root) -------------------------------------
+# ---------- Partitionierung (GPT: EFI + Root) ----------
 echo "[PART] Partitioniere $DISK (EFI + Btrfs)…"
 umount -R /mnt 2>/dev/null || true
 swapoff -a 2>/dev/null || true
@@ -118,37 +116,44 @@ mount -o subvol=@log,noatime,compress=zstd,space_cache=v2  "$ROOT" /mnt/var/log
 mount -o subvol=@pkg,noatime,compress=zstd,space_cache=v2  "$ROOT" /mnt/var/cache/pacman/pkg
 mount "$EFI" /mnt/boot
 
-# ---- Basisinstallation ------------------------------------------------------
+# ---------- Basisinstallation ----------
 echo "[PACSTRAP] Installiere Basissystem nach /mnt…"
 UCODE="intel-ucode"; grep -qi amd /proc/cpuinfo && UCODE="amd-ucode"
 pacstrap -K /mnt base base-devel linux linux-firmware "$UCODE" networkmanager sudo btrfs-progs git stow
-
 genfstab -U /mnt >> /mnt/etc/fstab
 
-# Werte vorbereiten, die wir im chroot brauchen
+# Daten für chroot
 ROOT_UUID="$(blkid -s PARTUUID -o value "$ROOT")"
 
-# ---- Systemkonfiguration im chroot -----------------------------------------
-echo "[CHROOT] System konfigurieren…"
-arch-chroot /mnt /bin/bash -euo pipefail <<CHROOT
-set -euo pipefail
+# ---------- Chroot-Setup-Skript schreiben ----------
+CHROOT_SCRIPT="/mnt/root/yamato-chroot-setup.sh"
+cat > "$CHROOT_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -eo pipefail
 
+# ======= Basiskonfig =======
 echo "$HOSTNAME" > /etc/hostname
-cat >/etc/hosts <<EOF
+cat >/etc/hosts <<'EOT'
 127.0.0.1   localhost
 ::1         localhost
 127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
-EOF
+EOT
 
-# Locale
-# Standardmäßig de_DE und en_US aktivieren, plus alle, die du angegeben hast
-sed -i 's/^#\(de_DE.UTF-8\|en_US.UTF-8\)/\1/' /etc/locale.gen
-IFS=, read -ra LCS <<<"$LOCALES"
-for l in "\${LCS[@]}"; do sed -i "s|^#\($l\)|\1|" /etc/locale.gen || true; done
+# Locales aktivieren (idempotent)
+add_locale() {
+  local loc="\$1"
+  grep -qE "^\\s*\${loc}\\s+UTF-8\\s*\$" /etc/locale.gen || echo "\${loc} UTF-8" >> /etc/locale.gen
+}
+# Standard + zusätzliche
+add_locale "en_US.UTF-8"
+add_locale "de_DE.UTF-8"
+IFS=',' read -r -a LCS <<< "$LOCALES"
+for l in "\${LCS[@]}"; do [[ -n "\$l" ]] && add_locale "\$l"; done
+
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
-# Zeit & Konsole
+# Zeit/Console
 ln -sf /usr/share/zoneinfo/$TZONE /etc/localtime
 hwclock --systohc
 printf "KEYMAP=$KEYMAP\nFONT=lat9w-16\n" > /etc/vconsole.conf
@@ -159,26 +164,25 @@ useradd -m -G wheel -s /bin/bash "$USERNAME"
 echo "$USERNAME:$PASS1" | chpasswd
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-# Bootloader (systemd-boot)
+# ======= Bootloader (systemd-boot) =======
 bootctl install
-cat >/boot/loader/loader.conf <<EOF
+cat >/boot/loader/loader.conf <<'EOT'
 default  arch
 timeout  3
 console-mode max
 editor   no
-EOF
+EOT
 
-KERNEL_PARAMS="root=$ROOT_UUID rw rootflags=subvol=@ quiet splash nowatchdog"
-cat >/boot/loader/entries/arch.conf <<EOF
+cat >/boot/loader/entries/arch.conf <<EOT
 title   Arch Linux
 linux   /vmlinuz-linux
 initrd  /$UCODE.img
 initrd  /initramfs-linux.img
-options \$KERNEL_PARAMS
-EOF
+options root=$ROOT_UUID rw rootflags=subvol=@ quiet splash nowatchdog
+EOT
 
-# Swapfile (optional, btrfs-konform)
-if [[ "$SWAPSIZE" != "0G" && "$SWAPSIZE" != "0" ]]; then
+# ======= Swap (optional) =======
+if [[ "$SWAPSIZE" != "0" && "$SWAPSIZE" != "0G" ]]; then
   mkdir -p /swap
   chattr +C /swap || true
   fallocate -l "$SWAPSIZE" /swap/swapfile
@@ -189,22 +193,23 @@ fi
 
 systemctl enable NetworkManager
 
-# First-Boot: Yamato
-install -Dm0755 /usr/local/bin/yamato-firstboot.sh /usr/local/bin/yamato-firstboot.sh <<'EOFHOOK'
+# ======= First-Boot: Yamato =======
+cat >/usr/local/bin/yamato-firstboot.sh <<'EOT'
 #!/usr/bin/env bash
 set -euo pipefail
 USER_NAME="$(awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd | head -n1)"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 REPO="https://github.com/b3luckyworks/yamato.git"
-sudo -u "$USER_NAME" mkdir -p "\$USER_HOME/git"
-if [[ ! -d "\$USER_HOME/git/yamato/.git" ]]; then
-  sudo -u "$USER_NAME" git clone "\$REPO" "\$USER_HOME/git/yamato"
+sudo -u "$USER_NAME" mkdir -p "$USER_HOME/git"
+if [[ ! -d "$USER_HOME/git/yamato/.git" ]]; then
+  sudo -u "$USER_NAME" git clone "$REPO" "$USER_HOME/git/yamato"
 fi
 sudo -u "$USER_NAME" bash -lc '"$HOME/git/yamato/scripts/install.sh" client || true'
 systemctl disable yamato-firstboot.service || true
-EOFHOOK
+EOT
+chmod 0755 /usr/local/bin/yamato-firstboot.sh
 
-install -Dm0644 /etc/systemd/system/yamato-firstboot.service /etc/systemd/system/yamato-firstboot.service <<'EOFSVC'
+cat >/etc/systemd/system/yamato-firstboot.service <<'EOT'
 [Unit]
 Description=Yamato First Boot Hook
 After=network-online.target
@@ -216,11 +221,23 @@ ExecStart=/usr/local/bin/yamato-firstboot.sh
 
 [Install]
 WantedBy=multi-user.target
-EOFSVC
-
+EOT
 systemctl enable yamato-firstboot.service
-CHROOT
+EOF
+chmod +x "$CHROOT_SCRIPT"
 
+# ---------- Chroot ausführen ----------
+echo "[CHROOT] System konfigurieren…"
+arch-chroot /mnt /bin/bash /root/yamato-chroot-setup.sh
+rm -f "$CHROOT_SCRIPT" || true
+
+# ---------- Abschluss ----------
 echo
-echo "==> Fertig. Jetzt 'reboot' ins neue System."
-echo "    Beim ersten Boot läuft der Yamato-Firstboot automatisch."
+echo "==> Installation abgeschlossen."
+echo "    Hostname: $HOSTNAME"
+echo "    Benutzer: $USERNAME"
+echo "    Bootloader: systemd-boot"
+echo "    Root-Partition: $ROOT  | EFI: $EFI"
+echo
+echo "→ Jetzt 'reboot' ins neue System."
+echo "  Beim ersten Boot läuft der Yamato-Firstboot automatisch (Repo klonen & scripts/install.sh client)."
