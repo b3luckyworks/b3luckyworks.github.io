@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+URL="https://github.com/b3luckyworks/yamato/releases/latest/download/yamato.sh"
+TMP="/tmp/yamato.sh"
+curl -fsSL "$URL" -o "$TMP"
+# Optional: SHA256-Check hier
+bash "$TMP"
