@@ -1,67 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-is_archiso() { [[ -d /run/archiso ]] || grep -q '^VARIANT_ID=archiso' /etc/os-release 2>/dev/null; }
+is_archiso() {
+  [[ -d /run/archiso ]] || grep -q '^VARIANT_ID=archiso' /etc/os-release 2>/dev/null
+}
 
 if is_archiso; then
-  echo "[yamato/bootstrap] Arch-ISO erkannt → starte TUI (archinstall)…"
+  echo "[yamato/bootstrap] Arch-ISO erkannt → starte den Arch-Installer (TUI)."
   timedatectl set-ntp true || true
-  pacman -Sy --noconfirm archinstall git
 
-  # --- Optional: First-Boot-Hook ins Zielsystem einhängen, sobald /mnt existiert ---
-  # Hinweis: Du kannst den Hook auch später per curl erledigen (siehe unten), aber so geht's One-Shot.
-  cat >/tmp/yamato-firstboot.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-USER_NAME="$(awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd | head -n1)"
-USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
-REPO="https://github.com/b3luckyworks/yamato.git"
-sudo -u "$USER_NAME" mkdir -p "$USER_HOME/git"
-if [[ ! -d "$USER_HOME/git/yamato/.git" ]]; then
-  sudo -u "$USER_NAME" git clone "$REPO" "$USER_HOME/git/yamato"
-fi
-sudo -u "$USER_NAME" bash -lc '"$HOME/git/yamato/scripts/install.sh" client'
-systemctl disable yamato-firstboot.service || true
-EOF
-
-  cat >/tmp/yamato-firstboot.service <<'EOF'
-[Unit]
-Description=Yamato First Boot Hook
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/yamato-firstboot.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  echo
-  echo ">>> Starte jetzt den Arch-Installer (TUI)."
-  echo ">>> Nach erfolgreicher Installation (Ziel unter /mnt) kopiere ich First-Boot-Hook und aktiviere ihn."
-  read -p "[Enter] öffnet den TUI … " _
-
-  archinstall  # ← interaktiver TUI für Partitionen, Benutzer, Desktop etc.
-
-  if mount | grep -q ' on /mnt '; then
-    echo "[yamato/bootstrap] /mnt gefunden → installiere First-Boot-Hook ins neue System…"
-    install -Dm0755 /tmp/yamato-firstboot.sh     /mnt/usr/local/bin/yamato-firstboot.sh
-    install -Dm0644 /tmp/yamato-firstboot.service /mnt/etc/systemd/system/yamato-firstboot.service
-    arch-chroot /mnt systemctl enable yamato-firstboot.service
-    echo "[yamato/bootstrap] First-Boot-Hook aktiviert. Nach dem Reboot startet Yamato automatisch."
-  else
-    echo "[yamato/bootstrap] Achtung: /mnt nicht gefunden. Wenn archinstall schon rebootet hat, ist das ok."
-    echo "→ Nach dem ersten Login im neuen System kannst du manuell ausführen:"
-    echo "   curl -fsSL https://b3luckyworks.github.io/install-yamato | bash"
+  # archinstall sicherstellen
+  if ! pacman -Qq archinstall >/dev/null 2>&1; then
+    pacman -Sy --noconfirm archinstall
   fi
 
+  # WICHTIG: Wenn das Script via 'curl | bash' läuft, stdin ist KEINE TTY → an /dev/tty binden
+  if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
+    exec </dev/tty
+  fi
+
+  echo
+  echo "Hinweis:"
+  echo "  1) Partitioniere/konfiguriere jetzt alles im TUI (archinstall)."
+  echo "  2) Reboote ins neue System."
+  echo "  3) Führe DANN denselben Befehl erneut aus, um Yamato zu konfigurieren:"
+  echo "     curl -fsSL https://b3luckyworks.github.io/install-yamato | bash"
+  echo
+
+  # TUI starten (jetzt mit echter TTY-Eingabe)
+  archinstall
+
+  # Nach Rückkehr aus dem TUI (falls kein Reboot erzwungen wurde):
+  echo
+  echo "[yamato/bootstrap] Archinstall beendet. Bitte ins neue System booten und dann:"
+  echo "curl -fsSL https://b3luckyworks.github.io/install-yamato | bash"
+  exit 0
 else
-  echo "[yamato/install] Normales System erkannt → führe Yamato install.sh aus…"
+  echo "[yamato/install] Normales System erkannt → Yamato installieren…"
   URL="https://raw.githubusercontent.com/b3luckyworks/yamato/HEAD/scripts/install.sh"
   TMP="/tmp/yamato-install.sh"
   curl -fsSL "$URL" -o "$TMP"
   chmod +x "$TMP"
+  # Optional: Modus übergeben (client/server), Standard = client
   bash "$TMP" "$@"
 fi
