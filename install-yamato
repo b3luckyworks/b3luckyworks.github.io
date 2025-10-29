@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-URL="https://github.com/b3luckyworks/yamato/scripts/install.sh"
-TMP="/tmp/yamato.sh"
+
+# Immer die aktuelle Version aus dem yamato-Repo laden:
+URL="https://raw.githubusercontent.com/b3luckyworks/yamato/HEAD/scripts/install.sh"
+TMP="/tmp/yamato-install.sh"
+
 curl -fsSL "$URL" -o "$TMP"
-# Optional: SHA256-Check hier
-bash "$TMP"
+chmod +x "$TMP"
+
+# Übergibt optional weitergereichte Argumente, z. B. "server"
+bash "$TMP" "$@"
