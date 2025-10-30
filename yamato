@@ -1,18 +1,12 @@
 #!/usr/bin/env bash
-# Kurz-Installer für Arch (TUI via archinstall) + Post-Setup für Yamato:
-# - Broadcom BCM43602 Fix (MBP 2015) ohne NM-Deadlock
-# - NetworkManager → iwd
-# - First-Boot-Hook: klont Repo und startet scripts/install.sh client
+# Yamato: minimaler Bootstrap ohne archinstall-Config
 set -euo pipefail
-
-# TTY für Prompts sicherstellen (auch bei "curl | bash")
 [[ ! -t 0 && -r /dev/tty ]] && exec </dev/tty
 
 is_archiso() { [[ -d /run/archiso ]] || grep -q '^VARIANT_ID=archiso' /etc/os-release 2>/dev/null; }
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Bitte als root auf dem Arch-Live-ISO ausführen."
-  exit 1
+  echo "Bitte als root auf dem Arch-Live-ISO ausführen."; exit 1
 fi
 
 if ! is_archiso; then
@@ -23,100 +17,21 @@ if ! is_archiso; then
 fi
 
 timedatectl set-ntp true || true
-
-# Nur kleine Tools ggf. nachinstallieren
 missing=()
 for p in archinstall curl git; do pacman -Qq "$p" >/dev/null 2>&1 || missing+=("$p"); done
 ((${#missing[@]})) && pacman -Sy --noconfirm --needed "${missing[@]}"
 
-# Template laden (Hostname/User fragt der TUI ab)
-TMPCFG="$(mktemp)"
-curl -fsSL https://b3luckyworks.github.io/yamato-archinstall.json.tmpl -o "$TMPCFG"
-
 echo
-echo "Starte archinstall (TUI)."
-echo "- Wähle Disk/Partitionierung & setze Hostname/Benutzer im TUI."
-echo "- Nach Abschluss kehrst du in diese Shell zurück (falls kein Auto-Reboot)."
+echo "Starte archinstall (ohne Config). Du wählst alles im TUI."
+echo "Nach Abschluss kehrst du (falls kein Auto-Reboot) in diese Shell zurück."
 echo
 
-archinstall --config "$TMPCFG" || { echo "archinstall abgebrochen/fehlgeschlagen."; exit 1; }
+archinstall || { echo "archinstall abgebrochen/fehlgeschlagen."; exit 1; }
 
-# Wenn archinstall /mnt gemountet lässt, richten wir WLAN-Fix + First-Boot ein
+# First-Boot-Hook nur, wenn /mnt noch gemountet ist
 if mount | grep -q ' on /mnt '; then
-  echo "[Yamato] /mnt gefunden → WLAN (Broadcom), NM/iwd und First-Boot-Hook installieren…"
+  echo "[Yamato] /mnt gefunden → First-Boot-Hook installieren…"
 
-  # --- NetworkManager: iwd-Backend + Tweaks ---
-  mkdir -p /mnt/etc/NetworkManager/conf.d
-  cat >/mnt/etc/NetworkManager/conf.d/10-wifi-tweaks.conf <<'EOF'
-[device]
-wifi.backend=iwd
-wifi.scan-rand-mac-address=no
-
-[connection]
-wifi.cloned-mac-address=stable
-EOF
-  # RegDom
-  echo 'REGDOMAIN=DE' > /mnt/etc/conf.d/wireless-regdom || true
-
-  # --- Broadcom BCM43602 One-Shot Fix (ohne NM-Restart, mit Timeout) ---
-  cat >/mnt/usr/local/bin/yamato-bcm43602.sh <<'EOF'
-#!/usr/bin/env bash
-# Broadcom BCM43602 (MBP 2015) – Boardfiles/Links + iwd/NM vorbereiten
-set -eo pipefail
-say(){ printf "[bcm43602] %s\n" "$*"; }
-
-rfkill unblock all || true
-iw reg set DE || true
-
-DLIB="/lib/firmware/brcm"
-DUSR="/usr/lib/firmware/brcm"
-mkdir -p "$DLIB"
-
-# Symlinks zu vorhandenen Firmware-Dateien
-for f in brcmfmac43602-pcie.bin brcmfmac43602-pcie.clm_blob brcmfmac43602-pcie.txcap_blob brcmfmac43602-pcie.txt; do
-  [[ -f "$DUSR/$f" ]] && ln -sf "$DUSR/$f" "$DLIB/$f"
-done
-
-# Apple-Model-Aliase
-for m in "MacBookPro11,4" "MacBookPro11,5"; do
-  ln -sf "$DLIB/brcmfmac43602-pcie.bin" "$DLIB/brcmfmac43602-pcie.Apple Inc.-$m.bin"
-done
-[[ -f "$DLIB/brcmfmac43602-pcie.txt" ]] && ln -sf "$DLIB/brcmfmac43602-pcie.txt" "$DLIB/brcmfmac43602.txt"
-
-# Treiber sauber neu laden
-modprobe -r b43 bcma brcmsmac ssb 2>/dev/null || true
-modprobe -r brcmfmac 2>/dev/null || true
-sleep 1
-modprobe brcmfmac 2>/dev/null || true
-
-say "Fertig. Prüfe später mit:  iw dev  |  nmcli device wifi list"
-# Service schaltet sich nach dem ersten Durchlauf ab
-systemctl disable --now yamato-bcm43602.service || true
-exit 0
-EOF
-  chmod 0755 /mnt/usr/local/bin/yamato-bcm43602.sh
-
-  cat >/mnt/etc/systemd/system/yamato-bcm43602.service <<'EOF'
-[Unit]
-Description=Yamato: Broadcom BCM43602 Setup (MBP 2015)
-After=local-fs.target systemd-modules-load.service
-Before=NetworkManager.service
-Wants=NetworkManager.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/yamato-bcm43602.sh
-TimeoutStartSec=20s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  # Enable (Kompatibilität: chroot vs arch-chroot)
-  chroot /mnt systemctl enable yamato-bcm43602.service 2>/dev/null || \
-  arch-chroot /mnt systemctl enable yamato-bcm43602.service
-
-  # --- First-Boot-Hook: Repo klonen & scripts/install.sh client ausführen ---
   cat >/mnt/usr/local/bin/yamato-firstboot.sh <<'EOF'
 #!/usr/bin/env bash
 set -eo pipefail
@@ -134,9 +49,15 @@ USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 REPO="https://github.com/b3luckyworks/yamato.git"
 sudo -u "$USER_NAME" mkdir -p "$USER_HOME/git"
 if [[ ! -d "$USER_HOME/git/yamato/.git" ]]; then
-  sudo -u "$USER_NAME" git clone "$REPO" "$USER_HOME/git/yamato"
+  sudo -u "$USER_NAME" git clone "$REPO" "$USER_HOME/git/yamato" || true
 fi
-sudo -u "$USER_NAME" bash -lc '"$HOME/git/yamato/scripts/install.sh" client || true'
+
+if [[ -x "$USER_HOME/git/yamato/scripts/install.sh" ]]; then
+  sudo -u "$USER_NAME" bash -lc '"$HOME/git/yamato/scripts/install.sh" client || true'
+else
+  echo "[yamato-firstboot] install.sh nicht gefunden – bitte später manuell ausführen."
+fi
+
 systemctl disable yamato-firstboot.service || true
 EOF
   chmod 0755 /mnt/usr/local/bin/yamato-firstboot.sh
@@ -144,7 +65,7 @@ EOF
   cat >/mnt/etc/systemd/system/yamato-firstboot.service <<'EOF'
 [Unit]
 Description=Yamato First Boot Hook
-After=network-online.target yamato-bcm43602.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -158,11 +79,11 @@ EOF
   chroot /mnt systemctl enable yamato-firstboot.service 2>/dev/null || \
   arch-chroot /mnt systemctl enable yamato-firstboot.service
 
-  echo "[Yamato] WLAN-Fix + First-Boot-Hook aktiviert. Nach dem Reboot richtet sich Yamato automatisch ein."
+  echo "[Yamato] First-Boot-Hook aktiviert. Nach dem Reboot richtet sich Yamato automatisch ein."
 else
   echo "[Yamato] /mnt nicht gefunden. Falls archinstall direkt rebootet hat, ist das okay."
   echo "Nach dem ersten Login bitte ausführen:"
-  echo "  curl -fsSL https://b3luckyworks.github.io/yamato | bash"
+  echo "  curl -fsSL https://raw.githubusercontent.com/b3luckyworks/yamato/HEAD/scripts/install.sh | bash -s -- client"
 fi
 
 echo
