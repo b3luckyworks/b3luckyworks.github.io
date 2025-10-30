@@ -1,0 +1,19 @@
+{
+  "keyboard-layout": "de-latin1",
+  "mirror-region": { "Germany": true },
+  "sys-language": "en_US",
+  "locale": ["de_DE.UTF-8", "en_US.UTF-8"],
+  "timezone": "Europe/Berlin",
+  "swap": true,
+  "swap-size": "2G",
+  "hostname": "__HOSTNAME__",
+  "bootloader": "Systemd-boot",
+  "filesystem": "btrfs",
+  "btrfs": { "subvolumes": ["@", "@home", "@log", "@pkg"] },
+  "users": [{
+    "username": "__USERNAME__",
+    "groups": ["wheel"],
+    "sudo": true
+  }],
+  "packages": ["git", "stow", "btrfs-progs", "networkmanager"]
+}
