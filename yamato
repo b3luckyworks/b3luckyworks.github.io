@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Kurz-Installer: fragt Hostname/Username, startet archinstall mit Template
+# und installiert danach den Yamato First-Boot-Hook ins Zielsystem.
+set -euo pipefail
+
+# Immer TTY für Prompts (auch bei "curl | bash")
+[[ ! -t 0 && -r /dev/tty ]] && exec </dev/tty
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Fehlt: $1"; exit 1; }; }
+is_archiso() { [[ -d /run/archiso ]] || grep -q '^VARIANT_ID=archiso' /etc/os-release 2>/dev/null; }
+
+prompt() { local p="$1" d="${2-}" a; printf "%s %s" "$p" "${d:+[$d]}: " > /dev/tty; IFS= read -r a < /dev/tty || true; echo "${a:-$d}"; }
+
+if [[ $EUID -ne 0 ]]; then echo "Bitte als root auf dem Arch-Live-ISO ausführen."; exit 1; fi
+if ! is_archiso; then
+  echo "[Yamato] Kein Arch-Live-ISO erkannt. Starte nur die Repo-Konfiguration…"
+  curl -fsSL https://raw.githubusercontent.com/b3luckyworks/yamato/HEAD/scripts/install.sh -o /tmp/yamato-install.sh
+  chmod +x /tmp/yamato-install.sh
+  exec bash /tmp/yamato-install.sh client
+fi
+
+timedatectl set-ntp true || true
+# Kleine Tools ggf. nachinstallieren
+missing=()
+for p in archinstall curl git; do pacman -Qq "$p" >/dev/null 2>&1 || missing+=("$p"); done
+((${#missing[@]})) && pacman -Sy --noconfirm --needed "${missing[@]}"
+
+echo "=== Yamato Bootstrap ==="
+HN="$(prompt 'Hostname' 'yamato')"
+USER="$(prompt 'Username' 'bjorn')"
+
+# Template laden & Platzhalter ersetzen
+TMPCFG="$(mktemp)"
+curl -fsSL https://b3luckyworks.github.io/yamato-archinstall.json.tmpl -o "$TMPCFG"
+# simple, sichere Ersetzung
+sed -i "s/__HOSTNAME__/${HN//\//\\/}/g; s/__USERNAME__/${USER//\//\\/}/g" "$TMPCFG"
+
+echo
+echo "Starte archinstall (TUI)."
+echo "- Wähle die Zielplatte/Partitionierung nach Wunsch."
+echo "- Nach Abschluss kehrst du in diese Shell zurück."
+echo
+
+archinstall --config "$TMPCFG" || {
+  echo "archinstall abgebrochen/fehlgeschlagen."; exit 1;
+}
+
+# Wenn archinstall /mnt gemountet lässt, kopieren wir jetzt den First-Boot-Hook
+if mount | grep -q ' on /mnt '; then
+  echo "[Yamato] /mnt gefunden → First-Boot-Hook installieren…"
+
+  cat >/mnt/usr/local/bin/yamato-firstboot.sh <<'EOF'
+#!/usr/bin/env bash
+set -eo pipefail
+# Benutzer robust ermitteln (UID>=1000, sonst erster /home/*)
+pick_user() {
+  local u
+  u="$(awk -F: '$3>=1000 && $1!="nobody"{print $1; exit}' /etc/passwd || true)"
+  [[ -n "$u" ]] && { echo "$u"; return; }
+  u="$(ls -1 /home 2>/dev/null | head -n1 || true)"
+  echo "$u"
+}
+USER_NAME="$(pick_user)"
+[[ -z "$USER_NAME" ]] && { echo "[yamato-firstboot] Kein Benutzer gefunden, beende."; exit 0; }
+USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
+
+REPO="https://github.com/b3luckyworks/yamato.git"
+sudo -u "$USER_NAME" mkdir -p "$USER_HOME/git"
+if [[ ! -d "$USER_HOME/git/yamato/.git" ]]; then
+  sudo -u "$USER_NAME" git clone "$REPO" "$USER_HOME/git/yamato"
+fi
+
+# Phase 2: Repo-Installer (client)
+sudo -u "$USER_NAME" bash -lc '"$HOME/git/yamato/scripts/install.sh" client || true'
+
+# Nur einmal beim ersten Boot
+systemctl disable yamato-firstboot.service || true
+EOF
+  chmod 0755 /mnt/usr/local/bin/yamato-firstboot.sh
+
+  cat >/mnt/etc/systemd/system/yamato-firstboot.service <<'EOF'
+[Unit]
+Description=Yamato First Boot Hook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/yamato-firstboot.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  arch-chroot /mnt systemctl enable yamato-firstboot.service
+  echo "[Yamato] First-Boot-Hook aktiviert. Nach dem Reboot wird Yamato automatisch eingerichtet."
+else
+  echo "[Yamato] /mnt nicht gefunden. Falls archinstall schon rebootet hat, ist das okay."
+  echo "Nach dem ersten Login bitte ausführen:"
+  echo "  curl -fsSL https://b3luckyworks.github.io/yamato | bash"
+fi
+
+echo
+echo "Fertig. Jetzt rebooten und ins neue System starten."
